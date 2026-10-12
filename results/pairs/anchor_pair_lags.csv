@@ -1,6 +1,0 @@
-Pair,Leader,Follower,Optimal_Lag,Lagged_Corr,Direction
-ONGC.NS - LT.NS,ONGC.NS,LT.NS,0,0.3879,No clear lead-lag (zero lag)
-TCS.NS - INFY.NS,TCS.NS,INFY.NS,0,0.6523,No clear lead-lag (zero lag)
-TCS.NS - RELIANCE.NS,TCS.NS,RELIANCE.NS,0,0.3472,No clear lead-lag (zero lag)
-ICICIBANK.NS - RELIANCE.NS,ICICIBANK.NS,RELIANCE.NS,0,0.4091,No clear lead-lag (zero lag)
-INFY.NS - RELIANCE.NS,INFY.NS,RELIANCE.NS,0,0.3058,No clear lead-lag (zero lag)

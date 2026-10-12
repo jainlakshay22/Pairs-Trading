@@ -1,1 +1,0 @@
-"""Reusable pair-comparison calculations."""
