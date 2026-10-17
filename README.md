@@ -11,7 +11,6 @@ Research on NSE stock relationships and prediction of a third stock from two inp
 - `results/validation/`: validation results for all 177 screened candidates, including failures.
 - `results/strategy/`: prototype backtest results.
 - `results/summary/`: combined table of 34 candidates passing the current validation rule.
-- `results/dashboard/`: HTML dashboard with embedded results; it does not update automatically when CSVs change.
 
 Existing virtual environments are preserved. The root `.venv/` is the environment used in the commands below; the older `data/.venv/` is also retained.
 
