@@ -1,0 +1,43 @@
+{
+  "split": "2023-01-01",
+  "horizons": [
+    1,
+    2,
+    3,
+    5
+  ],
+  "screened": 27600,
+  "training_selected": 639,
+  "selection_rule": "Both unrounded training OLS p < 0.05 and training R2 > 0.01; no test-based filtering",
+  "training_BY_q_below_005": 0,
+  "training_rolling_pass": 0,
+  "training_shift_pass": 639,
+  "positive_test_R2_train_mean": 32,
+  "positive_test_R2_test_mean_descriptive": 26,
+  "beats_both_single_inputs": 13,
+  "permutations": 1000,
+  "seed": 42,
+  "data_first": "2019-01-02",
+  "data_last": "2025-12-30",
+  "source_sha256": "1dbd31f0184fed730795738daabddfdc6c77d83e30c86de3bfb7e27a13b8ceb0",
+  "candidate_sha256": "4c6161f7701bcfb0f97329c06de381a9e13f3f854a0f0ea0feb4768d8a594230",
+  "script_sha256": {
+    "triplet_screener_v2.py": "701e82b47615af896ecd189bfb1b94a48a3fa4ec2c05028225ef6d609fae58ad",
+    "triplet_validation.py": "07b077e51009f5e14e30fae57060c8a33de4324c9513abaaeec1fe0bfaf83090",
+    "compile_results.py": "a67e150513b8666d3d286eab868774b0e52c9f9597ed8e5ca60ae9dc30f36327"
+  },
+  "versions": {
+    "python": "3.14.6",
+    "numpy": "2.5.2",
+    "pandas": "3.0.5",
+    "scipy": "1.18.0",
+    "statsmodels": "0.14.6"
+  },
+  "limitations": [
+    "Retrospective evaluation: 2023-2025 has already been inspected in earlier work.",
+    "Existing input data was filled by the legacy downloader; original missingness and adjustment audit remains outstanding.",
+    "Nominal screening is exploratory; BY-adjusted results are reported separately.",
+    "Circular-shift diagnostic assumes a suitable time-series null and is not proof of causality or regime stability.",
+    "No models are declared validated using test performance. No trading metrics are produced."
+  ]
+}

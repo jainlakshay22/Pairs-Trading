@@ -1,0 +1,15 @@
+{
+  "source_sha256": "1dbd31f0184fed730795738daabddfdc6c77d83e30c86de3bfb7e27a13b8ceb0",
+  "candidate_sha256": "4c6161f7701bcfb0f97329c06de381a9e13f3f854a0f0ea0feb4768d8a594230",
+  "screen_sha256": "04575577f77bb51e73e409ab11f3e891408a6da5e5a8a396f1e284e5f497eaf8",
+  "split": "2023-01-01",
+  "horizons": [
+    1,
+    2,
+    3,
+    5
+  ],
+  "screened": 27600,
+  "training_selected": 639,
+  "screening_script_sha256": "701e82b47615af896ecd189bfb1b94a48a3fa4ec2c05028225ef6d609fae58ad"
+}

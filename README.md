@@ -14,25 +14,24 @@ Research on NSE stock relationships and prediction of a third stock from two inp
 
 Existing virtual environments are preserved. The root `.venv/` is the environment used in the commands below; the older `data/.venv/` is also retained.
 
-## Running the pipeline
+## Running the corrected prediction study
 
-Run these commands from the project root. Scripts also resolve data paths correctly when invoked by absolute path from another directory. Execute scripts directly as shown, rather than as Python modules.
+Use the existing return dataset; fetching and transformation are not required for this run.
 
 ```sh
-.venv/bin/python calculations/fetcher.py
-.venv/bin/python calculations/transform.py
-.venv/bin/python calculations/triplet_screener_v2.py
-.venv/bin/python calculations/triplet_validation.py
-.venv/bin/python calculations/triplet_strategy.py
-.venv/bin/python calculations/compile_results.py
+.venv/bin/python -u calculations/triplet_screener_v2.py
+.venv/bin/python -u calculations/triplet_validation.py
+.venv/bin/python -u calculations/compile_results.py
 ```
 
-Fetching needs internet and replaces the cleaned price dataset. Each subsequent stage replaces its corresponding result files. Full-universe screening and validation may take substantial time. Validation consumes the full-universe screener output.
+Run each command only after the previous one completes successfully. Output files are saved directly under `results/training_only/`. Upload `summary.json`, `final_results_table.csv`, `training_screen_all.csv`, and `test_predictions.csv`; no ZIP is created. Previous result files remain historical and are not inputs to the corrected run.
 
-The existing environment uses NumPy, pandas, statsmodels, and yfinance. There is no pinned dependency lockfile yet.
+Screening uses only 2019-2022 observations and targets. Candidate identifiers and training coefficients are frozen before evaluation. Validation evaluates every candidate against single-input and training-mean forecasts; it does not select models using 2023-2025 performance. Compilation retains every candidate and saves the final results table and summary metadata. File hashes prevent mixing data or results from different stages.
 
-## Interpretation of existing results
+For another run, pass the same new `--output results/training_only_run2` argument to all three commands. Screening refuses an existing output folder. Validation uses 1,000 paired circular shifts by default; this differs from the old A-only shuffle. Multiple-testing-adjusted values and HAC diagnostics are reported separately from the nominal exploratory screen.
 
-The saved data covers January 2019 through December 2025. The full screen contains 27,600 triplet–horizon models, 177 initial survivors, and 34 passing the current two-of-three validation rule. None passes rolling stability.
+Do not run `triplet_strategy.py` as part of this study: it remains a legacy backtest with known coefficient and holding-period accounting issues. No trading results are compiled. Existing tables/dashboard are historical, not corrected outputs.
 
-The current triplet workflow and its existing results are retained. Earlier pair-screening methods and the five-anchor experiment were removed from the working folder; they remain recoverable in Git commit `f5ab5e9`. Known methodological issues remain: full-sample candidate selection precedes the holdout test; the backtest uses full-sample coefficients, records only the final daily return for a multi-day hold, and counts nonzero cash-flow days as trades. Treat trading metrics and automatically generated economic explanations as preliminary. The dashboard is a saved presentation snapshot.
+## Interpretation
+
+This fixes training/test selection boundaries in the analysis, but 2023-2025 has already been examined, so evaluation is retrospective. The existing dataset's missing-value treatment and price adjustments still require an audit. Statistical diagnostics do not prove causality, stable regimes or profitability. Do not reuse the old 177/34 counts or the unverified HTML's 630/25 counts as corrected results; use the outputs of the new run.

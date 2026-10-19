@@ -1,0 +1,8 @@
+{
+  "source_sha256": "1dbd31f0184fed730795738daabddfdc6c77d83e30c86de3bfb7e27a13b8ceb0",
+  "candidate_sha256": "4c6161f7701bcfb0f97329c06de381a9e13f3f854a0f0ea0feb4768d8a594230",
+  "permutations": 1000,
+  "validation_script_sha256": "07b077e51009f5e14e30fae57060c8a33de4324c9513abaaeec1fe0bfaf83090",
+  "evaluation_sha256": "9e6fde51faa0bf6c503306f64f483288f4c263c5007c6a238358488212c65c9a",
+  "predictions_sha256": "bc5beca17dbd659d1b651c2ad225cf27ec64ba0e54c3e141e53a7026683b77ce"
+}

@@ -1,268 +1,82 @@
-"""
-Step 4: Triplet Validation
-Three tests on the 178 significant triplets from triplet_full_significant.csv:
-
-1. Rolling Window Stability  — 252-day windows, check if beta is significant
-                               in ≥60% of windows
-2. Shuffle / Permutation Test — permute r_A 1000 times, check if real R²
-                                is in top 5% of shuffle distribution
-3. Out-of-Sample (OOS)        — train 2019-2022, test 2023-2026, record IS/OOS R²
-
-Outputs:
-  validated_triplets.csv — all triplets with validation columns appended
-"""
-
-from project_paths import project_file
-
-import pandas as pd
+"""Stage 2: training diagnostics and evaluation of every frozen candidate."""
+from triplet_screener_v2 import (ROOT,SPLIT,HORIZONS,KEYS,aligned,fit,r2,parse_args,digest,load_frame,verify_source)
+from pathlib import Path
+import json
+import hashlib
 import numpy as np
+import pandas as pd
 import statsmodels.api as sm
-
-# ── Config ─────────────────────────────────────────────────────────────────────
-ROLLING_WINDOW  = 252        # trading days per window
-MIN_SIG_PCT     = 0.60       # ≥60% of windows must show p<0.05 for BOTH betas
-N_SHUFFLES      = 1000       # permutation test iterations
-SHUFFLE_ALPHA   = 0.05       # real R² must beat 95th pct of shuffle distribution
-SPLIT_DATE      = "2023-01-01"   # IS: before, OOS: on or after
-P_THRESHOLD     = 0.05
-
-# ── Load data ──────────────────────────────────────────────────────────────────
-returns_df = pd.read_csv(project_file("nse_log_returns.csv"), index_col=0, parse_dates=True)
-sig_df     = pd.read_csv(project_file("triplet_full_significant.csv"))
-
-ALL_STOCKS = list(returns_df.columns)
-n          = len(returns_df)
-dates      = returns_df.index
-
-print(f"Returns shape : {returns_df.shape}")
-print(f"Triplets to validate: {len(sig_df)}")
-print(f"IS / OOS split : before / on-or-after {SPLIT_DATE}\n")
-
-returns = {s: returns_df[s].to_numpy() for s in ALL_STOCKS}
-dates_arr = dates.to_numpy()
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-def ols_r2_pvals(y, x1, x2):
-    """Return (r2, p1, p2) from OLS y ~ 1 + x1 + x2. NaN on failure."""
-    mask = np.isfinite(x1) & np.isfinite(x2) & np.isfinite(y)
-    if mask.sum() < 30:
-        return np.nan, np.nan, np.nan
-    X = sm.add_constant(np.column_stack([x1[mask], x2[mask]]))
-    try:
-        res = sm.OLS(y[mask], X).fit()
-        return res.rsquared, res.pvalues[1], res.pvalues[2]
-    except Exception:
-        return np.nan, np.nan, np.nan
+def diagnostics(x, y, model, k, permutations, rng):
+    """Training-only diagnostics, not an independent validation or causal test."""
+    passed = 0
+    windows = max(0, len(y)-252+1)
+    for start in range(windows):
+        m = fit(x[start:start+252], y[start:start+252])
+        passed += int(np.all(m.pvalues[1:] < .05))
+    # Circularly shift the whole input pair together to retain A/B dependence.
+    # This is a sensitivity diagnostic: nonstationarity can invalidate its null.
+    shifts = np.arange(20, len(y)-19)
+    actual = model.rsquared
+    count = 0
+    for shift in rng.choice(shifts, size=permutations, replace=True):
+        shuffled = np.roll(x, int(shift), axis=0)
+        m = fit(shuffled, y)
+        count += int(m.rsquared >= actual)
+    robust = model.get_robustcov_results(cov_type='HAC', maxlags=max(5,k))
+    return dict(Train_Rolling_Windows=windows,
+                Train_Rolling_Sig_Fraction=passed/windows if windows else np.nan,
+                Train_Shift_P=(count+1)/(permutations+1),
+                Train_HAC_p_A=float(robust.pvalues[1]),
+                Train_HAC_p_B=float(robust.pvalues[2]))
 
 
-def rolling_stability(r_a, r_b, r_c, k, window=ROLLING_WINDOW):
-    """
-    Slide a window of `window` days across the full series.
-    At each step: regress r_C(t+k) ~ r_A(t) + r_B(t).
-    Return fraction of windows where BOTH p_beta1 < 0.05 and p_beta2 < 0.05.
-    """
-    max_start = n - window - k
-    if max_start < 1:
-        return np.nan
+def main():
+    args=parse_args(__doc__,shuffles=True)
+    out=args.output.resolve()
+    meta=json.loads((out/'screen_manifest.json').read_text())
+    source,frame=load_frame();verify_source(meta,source)
+    if digest(Path(__file__).with_name('triplet_screener_v2.py'))!=meta['screening_script_sha256']:
+        raise ValueError('Screening code changed; rerun screening.')
+    frozen_hash=meta['candidate_sha256']
+    if digest(out/'frozen_training_candidates.csv')!=frozen_hash: raise ValueError('Frozen candidate list changed')
+    if (out/'validation_manifest.json').exists(): raise SystemExit('Validation already completed in this folder. Use a new screening output directory for a new run.')
+    candidates=pd.read_csv(out/'frozen_training_candidates.csv')
+    records=[]; predictions=[]
+    rng=np.random.default_rng(42)
+    for number,(_,row) in enumerate(candidates.iterrows(),1):
+        a,b,c,k=row.Stock_A,row.Stock_B,row.Stock_C,int(row.Horizon_k)
+        x,y,fd,td,tr,te=aligned(frame,a,b,c,k)
+        xt,yt,xo,yo=x[tr],y[tr],x[te],y[te]
+        m=fit(xt,yt)
+        pred=m.predict(sm.add_constant(xo,has_constant='add'))
+        pred_a=fit(xt[:,[0]],yt).predict(sm.add_constant(xo[:,[0]],has_constant='add'))
+        pred_b=fit(xt[:,[1]],yt).predict(sm.add_constant(xo[:,[1]],has_constant='add'))
+        base=float(yt.mean())
+        d=row.to_dict();d.update(diagnostics(xt,yt,m,k,args.shuffles,rng))
+        d.update(N_Test=int(te.sum()),Test_First_Feature=str(fd[te][0].date()),
+            Test_First_Target=str(td[te][0].date()),Train_Target_Mean=base,
+            Test_R2_TrainMean=r2(yo,pred,base),
+            Test_R2_TestMean_Descriptive=r2(yo,pred,yo.mean()),
+            Test_R2_A_Only=r2(yo,pred_a,base),Test_R2_B_Only=r2(yo,pred_b,base),
+            Test_MSE_AB=float(np.mean((yo-pred)**2)),
+            Test_MSE_A=float(np.mean((yo-pred_a)**2)),Test_MSE_B=float(np.mean((yo-pred_b)**2)))
+        records.append(d)
+        predictions.append(pd.DataFrame(dict(Stock_A=a,Stock_B=b,Stock_C=c,Horizon_k=k,
+            Feature_Date=fd[te],Target_Date=td[te],Actual=yo,Prediction_AB=pred,
+            Prediction_A=pred_a,Prediction_B=pred_b,Training_Mean=base)))
+        if number%10==0 or number==len(candidates):
+            print(f'Diagnostics and evaluation {number}/{len(candidates)}',flush=True)
+    extra=['Train_Rolling_Windows','Train_Rolling_Sig_Fraction','Train_Shift_P','Train_HAC_p_A','Train_HAC_p_B','N_Test','Test_First_Feature','Test_First_Target','Train_Target_Mean','Test_R2_TrainMean','Test_R2_TestMean_Descriptive','Test_R2_A_Only','Test_R2_B_Only','Test_MSE_AB','Test_MSE_A','Test_MSE_B']
+    result=pd.DataFrame(records,columns=list(candidates.columns)+extra)
+    result.to_csv(out/'candidate_evaluation.csv',index=False)
+    pred_columns=KEYS+['Feature_Date','Target_Date','Actual','Prediction_AB','Prediction_A','Prediction_B','Training_Mean']
+    (pd.concat(predictions,ignore_index=True) if predictions else pd.DataFrame(columns=pred_columns)).to_csv(out/'test_predictions.csv',index=False)
+    assert hashlib.sha256((out/'frozen_training_candidates.csv').read_bytes()).hexdigest()==frozen_hash
 
-    sig_count = 0
-    total     = 0
-    for start in range(0, max_start):
-        idx = np.arange(start, start + window)
-        y   = r_c[idx + k]
-        x1  = r_a[idx]
-        x2  = r_b[idx]
-        _, p1, p2 = ols_r2_pvals(y, x1, x2)
-        if np.isnan(p1):
-            continue
-        total += 1
-        if p1 < P_THRESHOLD and p2 < P_THRESHOLD:
-            sig_count += 1
+    manifest=dict(source_sha256=digest(source),candidate_sha256=frozen_hash,permutations=args.shuffles,
+        validation_script_sha256=digest(__file__),evaluation_sha256=digest(out/'candidate_evaluation.csv'),
+        predictions_sha256=digest(out/'test_predictions.csv'))
+    (out/'validation_manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
+    print('Evaluation complete. Next run compile_results.py.',flush=True)
 
-    return sig_count / total if total > 0 else np.nan
-
-
-def shuffle_test(r_a, r_b, r_c, k, n_shuffles=N_SHUFFLES, rng=None):
-    """
-    Permute r_A randomly n_shuffles times.
-    Return p-value = fraction of shuffles with R² ≥ real R².
-    Also return the real R².
-    """
-    if rng is None:
-        rng = np.random.default_rng(42)
-
-    t_end = n - k - 1
-    idx   = np.arange(0, t_end + 1)
-    y     = r_c[idx + k]
-    x1    = r_a[idx]
-    x2    = r_b[idx]
-
-    real_r2, _, _ = ols_r2_pvals(y, x1, x2)
-    if np.isnan(real_r2):
-        return np.nan, np.nan
-
-    shuffle_r2s = np.empty(n_shuffles)
-    for i in range(n_shuffles):
-        x1_shuf = rng.permutation(x1)
-        r2_s, _, _ = ols_r2_pvals(y, x1_shuf, x2)
-        shuffle_r2s[i] = r2_s if not np.isnan(r2_s) else 0.0
-
-    pval = np.mean(shuffle_r2s >= real_r2)
-    return pval, real_r2
-
-
-def oos_validation(r_a, r_b, r_c, k, split_date=SPLIT_DATE):
-    """
-    IS: dates < split_date   → fit OLS
-    OOS: dates >= split_date → compute R² on held-out data using IS betas.
-    Returns (is_r2, oos_r2).
-    """
-    split_idx = np.searchsorted(dates_arr, np.datetime64(split_date))
-
-    # IS indices
-    is_end = split_idx - k - 1
-    if is_end < 30:
-        return np.nan, np.nan
-
-    is_idx = np.arange(0, is_end + 1)
-    y_is   = r_c[is_idx + k]
-    x1_is  = r_a[is_idx]
-    x2_is  = r_b[is_idx]
-    mask_is = np.isfinite(x1_is) & np.isfinite(x2_is) & np.isfinite(y_is)
-    if mask_is.sum() < 30:
-        return np.nan, np.nan
-
-    X_is = sm.add_constant(np.column_stack([x1_is[mask_is], x2_is[mask_is]]))
-    try:
-        res_is = sm.OLS(y_is[mask_is], X_is).fit()
-    except Exception:
-        return np.nan, np.nan
-
-    is_r2  = res_is.rsquared
-    params = res_is.params   # [alpha, beta1, beta2]
-
-    # OOS indices
-    oos_start = split_idx
-    oos_end   = n - k - 1
-    if oos_end <= oos_start + 30:
-        return is_r2, np.nan
-
-    oos_idx = np.arange(oos_start, oos_end + 1)
-    y_oos   = r_c[oos_idx + k]
-    x1_oos  = r_a[oos_idx]
-    x2_oos  = r_b[oos_idx]
-    mask_oos = np.isfinite(x1_oos) & np.isfinite(x2_oos) & np.isfinite(y_oos)
-    if mask_oos.sum() < 30:
-        return is_r2, np.nan
-
-    y_pred = (params[0]
-              + params[1] * x1_oos[mask_oos]
-              + params[2] * x2_oos[mask_oos])
-    y_act  = y_oos[mask_oos]
-
-    ss_res = np.sum((y_act - y_pred) ** 2)
-    ss_tot = np.sum((y_act - y_act.mean()) ** 2)
-    oos_r2 = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
-
-    return is_r2, oos_r2
-
-
-# ── Main loop ─────────────────────────────────────────────────────────────────
-rng = np.random.default_rng(42)
-
-roll_pcts   = []
-shuf_pvals  = []
-is_r2s      = []
-oos_r2s     = []
-
-total = len(sig_df)
-print("Running validation (this takes a few minutes)...")
-print(f"{'Row':>5}  {'A':>12}  {'B':>12}  {'C':>12}  {'k':>3}  "
-      f"{'Roll%':>6}  {'Shuf_p':>7}  {'IS_R²':>7}  {'OOS_R²':>8}")
-print("-" * 80)
-
-for i, row in sig_df.iterrows():
-    A = row["Stock_A"]
-    B = row["Stock_B"]
-    C = row["Stock_C"]
-    k = int(row["Horizon_k"])
-
-    r_a = returns[A]
-    r_b = returns[B]
-    r_c = returns[C]
-
-    # 1. Rolling stability
-    roll_pct = rolling_stability(r_a, r_b, r_c, k)
-
-    # 2. Shuffle test
-    shuf_p, _ = shuffle_test(r_a, r_b, r_c, k, rng=rng)
-
-    # 3. OOS
-    is_r2, oos_r2 = oos_validation(r_a, r_b, r_c, k)
-
-    roll_pcts.append(roll_pct)
-    shuf_pvals.append(shuf_p)
-    is_r2s.append(is_r2)
-    oos_r2s.append(oos_r2)
-
-    if (i + 1) % 20 == 0 or (i + 1) == total:
-        rp   = f"{roll_pct:.2f}" if not np.isnan(roll_pct) else "NaN"
-        sp   = f"{shuf_p:.3f}"   if not np.isnan(shuf_p)   else "NaN"
-        isr  = f"{is_r2:.4f}"   if not np.isnan(is_r2)     else "NaN"
-        oosr = f"{oos_r2:.4f}"  if not np.isnan(oos_r2)    else "NaN"
-        print(f"{i+1:>5}  {A:>12}  {B:>12}  {C:>12}  {k:>3}  "
-              f"{rp:>6}  {sp:>7}  {isr:>7}  {oosr:>8}")
-
-# ── Assemble results ──────────────────────────────────────────────────────────
-out_df = sig_df.copy()
-out_df["Rolling_Sig_Pct"] = np.round(roll_pcts, 3)
-out_df["Shuffle_pval"]    = np.round(shuf_pvals, 4)
-out_df["IS_R2"]           = np.round(is_r2s, 4)
-out_df["OOS_R2"]          = np.round(oos_r2s, 4)
-
-# ── Verdict ───────────────────────────────────────────────────────────────────
-out_df["Stable"]  = out_df["Rolling_Sig_Pct"] >= MIN_SIG_PCT
-out_df["Genuine"] = out_df["Shuffle_pval"]    <  SHUFFLE_ALPHA
-out_df["OOS_Pos"] = out_df["OOS_R2"]          >  0
-
-# A triplet "passes" if it clears at least 2 of 3 tests
-out_df["Tests_Passed"] = (
-    out_df["Stable"].astype(int) +
-    out_df["Genuine"].astype(int) +
-    out_df["OOS_Pos"].astype(int)
-)
-out_df["Validated"] = out_df["Tests_Passed"] >= 2
-
-out_df = out_df.sort_values(["Validated", "OOS_R2"], ascending=[False, False])
-out_df.to_csv(project_file("validated_triplets.csv"), index=False)
-
-# ── Summary ───────────────────────────────────────────────────────────────────
-print("\n" + "=" * 60)
-print("VALIDATION SUMMARY")
-print("=" * 60)
-print(f"Total triplets tested     : {len(out_df)}")
-print(f"Rolling stable (≥60%)     : {out_df['Stable'].sum()}")
-print(f"Genuine (shuffle p<0.05)  : {out_df['Genuine'].sum()}")
-print(f"OOS R² > 0                : {out_df['OOS_Pos'].sum()}")
-print(f"Validated (≥2 of 3 tests) : {out_df['Validated'].sum()}")
-
-validated = out_df[out_df["Validated"]]
-if len(validated) > 0:
-    print(f"\n=== TOP VALIDATED TRIPLETS BY OOS R² ===")
-    cols = ["Stock_A", "Stock_B", "Stock_C", "Horizon_k",
-            "R2", "IS_R2", "OOS_R2", "Rolling_Sig_Pct", "Shuffle_pval", "Tests_Passed"]
-    print(validated[cols].head(20).to_string(index=False))
-
-    print(f"\n=== VALIDATED TRIPLETS BY HORIZON ===")
-    print(validated.groupby("Horizon_k").size().rename("Count"))
-
-    print(f"\n=== MOST FREQUENTLY VALIDATED Stock_C ===")
-    print(validated["Stock_C"].value_counts().head(10))
-else:
-    print("\nNo triplets passed ≥2 tests. Showing best by OOS R²:")
-    cols = ["Stock_A", "Stock_B", "Stock_C", "Horizon_k",
-            "R2", "IS_R2", "OOS_R2", "Rolling_Sig_Pct", "Shuffle_pval"]
-    print(out_df[cols].head(20).to_string(index=False))
-
-print(f"\nSaved → validated_triplets.csv")
+if __name__=='__main__': main()

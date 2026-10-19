@@ -1,153 +1,50 @@
-"""
-Step 7: Compile Final Results Table
-====================================
-Merges validation + strategy results into one clean table for the report.
-Also adds economic interpretation for each validated triplet.
-"""
-
-from project_paths import project_file
-
-import pandas as pd
+"""Stage 3: summarize all candidates and save result files, without test-based selection."""
+from triplet_screener_v2 import (SPLIT,HORIZONS,parse_args,digest,load_frame,verify_source)
+from pathlib import Path
+import hashlib,json,platform
 import numpy as np
+import pandas as pd
+import scipy,statsmodels
 
-# ── Economic interpretation lookup ────────────────────────────────────────────
-# Sector mapping
-SECTOR = {
-    "TCS.NS":        "IT",
-    "INFY.NS":       "IT",
-    "HCLTECH.NS":    "IT",
-    "WIPRO.NS":      "IT",
-    "TECHM.NS":      "IT",
-    "HDFCBANK.NS":   "Finance",
-    "ICICIBANK.NS":  "Finance",
-    "SBIN.NS":       "Finance",
-    "KOTAKBANK.NS":  "Finance",
-    "AXISBANK.NS":   "Finance",
-    "SUNPHARMA.NS":  "Healthcare",
-    "DRREDDY.NS":    "Healthcare",
-    "CIPLA.NS":      "Healthcare",
-    "APOLLOHOSP.NS": "Healthcare",
-    "DIVISLAB.NS":   "Healthcare",
-    "RELIANCE.NS":   "Energy",
-    "ONGC.NS":       "Energy",
-    "NTPC.NS":       "Energy",
-    "POWERGRID.NS":  "Energy",
-    "BPCL.NS":       "Energy",
-    "LT.NS":         "Industrials",
-    "SIEMENS.NS":    "Industrials",
-    "ABB.NS":        "Industrials",
-    "BEL.NS":        "Industrials",
-    "HAL.NS":        "Industrials",
-}
+def main():
+    args=parse_args(__doc__);out=args.output.resolve()
+    source,frame=load_frame()
+    meta=json.loads((out/'screen_manifest.json').read_text());verify_source(meta,source)
+    vm=json.loads((out/'validation_manifest.json').read_text())
+    frozen_hash=digest(out/'frozen_training_candidates.csv')
+    for file,key,manifest in [('training_screen_all.csv','screen_sha256',meta),('frozen_training_candidates.csv','candidate_sha256',meta),('candidate_evaluation.csv','evaluation_sha256',vm),('test_predictions.csv','predictions_sha256',vm)]:
+        if digest(out/file)!=manifest[key]: raise ValueError(f'{file} changed since its preceding stage')
+    if vm['source_sha256']!=meta['source_sha256'] or vm['candidate_sha256']!=frozen_hash:
+        raise ValueError('Screening and validation provenance do not match')
+    for name,key,manifest in [('triplet_screener_v2.py','screening_script_sha256',meta),('triplet_validation.py','validation_script_sha256',vm)]:
+        if digest(Path(__file__).with_name(name))!=manifest[key]:raise ValueError(f'{name} changed since execution')
+    screen=pd.read_csv(out/'training_screen_all.csv');candidates=pd.read_csv(out/'frozen_training_candidates.csv');result=pd.read_csv(out/'candidate_evaluation.csv')
+    keys=['Stock_A','Stock_B','Stock_C','Horizon_k']
+    if not candidates[keys].equals(result[keys]):raise ValueError('Evaluation must contain every frozen candidate in order')
+    summary=dict(split=str(SPLIT.date()),horizons=list(HORIZONS),screened=len(screen),
+        training_selected=len(candidates),selection_rule='Both unrounded training OLS p < 0.05 and training R2 > 0.01; no test-based filtering',
+        training_BY_q_below_005=int((candidates.Train_BY_Q<.05).sum()),
+        training_rolling_pass=int((result.Train_Rolling_Sig_Fraction>=.6).sum()) if len(result) else 0,
+        training_shift_pass=int((result.Train_Shift_P<.05).sum()) if len(result) else 0,
+        positive_test_R2_train_mean=int((result.Test_R2_TrainMean>0).sum()) if len(result) else 0,
+        positive_test_R2_test_mean_descriptive=int((result.Test_R2_TestMean_Descriptive>0).sum()) if len(result) else 0,
+        beats_both_single_inputs=int(((result.Test_MSE_AB<result.Test_MSE_A)&(result.Test_MSE_AB<result.Test_MSE_B)).sum()) if len(result) else 0,
+        permutations=vm['permutations'],seed=42,data_first=str(frame.index.min().date()),data_last=str(frame.index.max().date()),
+        source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),candidate_sha256=frozen_hash,
+        script_sha256={name:digest(Path(__file__).with_name(name)) for name in ['triplet_screener_v2.py','triplet_validation.py','compile_results.py']},
+        versions=dict(python=platform.python_version(),numpy=np.__version__,pandas=pd.__version__,scipy=scipy.__version__,statsmodels=statsmodels.__version__),
+        limitations=['Retrospective evaluation: 2023-2025 has already been inspected in earlier work.',
+        'Existing input data was filled by the legacy downloader; original missingness and adjustment audit remains outstanding.',
+        'Nominal screening is exploratory; BY-adjusted results are reported separately.',
+        'Circular-shift diagnostic assumes a suitable time-series null and is not proof of causality or regime stability.',
+        'No models are declared validated using test performance. No trading metrics are produced.'])
 
-def interpret(row):
-    A, B, C = row["Stock_A"], row["Stock_B"], row["Stock_C"]
-    sa, sb, sc = SECTOR.get(A,"?"), SECTOR.get(B,"?"), SECTOR.get(C,"?")
-    b1, b2 = row["Beta1_A"], row["Beta2_B"]
-    k = row["Horizon_k"]
+    (out/'summary.json').write_text(json.dumps(summary,indent=2)+'\n')
+    # No selection or reordering by test performance.
+    result.to_csv(out/'final_results_table.csv',index=False)
+    print(json.dumps(summary,indent=2),flush=True)
+    print(f'Upload these files from {out}:',flush=True)
+    for name in ['summary.json','final_results_table.csv','training_screen_all.csv','test_predictions.csv']:
+        print(f'  {name}',flush=True)
 
-    # Cross-sector positive beta = spillover / contagion
-    # Same-sector positive beta = momentum / sympathy
-    # Negative beta = rotation / mean-reversion
-
-    a_clean = A.replace(".NS","")
-    b_clean = B.replace(".NS","")
-    c_clean = C.replace(".NS","")
-
-    if sa == sc and sb == sc:
-        # All same sector — intra-sector momentum
-        return f"Intra-{sa} momentum: {a_clean}+{b_clean} joint movement predicts {c_clean} at t+{k}d lag"
-
-    # Mixed sectors
-    if sa != sc or sb != sc:
-        # Determine if it looks like rotation (negative beta)
-        neg_a = b1 < 0
-        neg_b = b2 < 0
-        if neg_a and not neg_b:
-            return (f"Sector rotation: {sa} ({a_clean}) weakness + {sb} ({b_clean}) strength "
-                    f"→ {sc} ({c_clean}) gain at t+{k}d (capital flow from {sa} to {sc})")
-        elif neg_b and not neg_a:
-            return (f"Sector rotation: {sa} ({a_clean}) strength + {sb} ({b_clean}) weakness "
-                    f"→ {sc} ({c_clean}) gain at t+{k}d (capital flow from {sb} to {sc})")
-        elif neg_a and neg_b:
-            return (f"Risk-off signal: {sa} ({a_clean}) + {sb} ({b_clean}) joint weakness "
-                    f"→ {sc} ({c_clean}) gain at t+{k}d (defensive rotation)")
-        else:
-            return (f"Cross-sector spillover: {sa} ({a_clean}) + {sb} ({b_clean}) joint strength "
-                    f"→ {sc} ({c_clean}) gain at t+{k}d (risk-on contagion)")
-    return "Mixed cross-sector signal"
-
-
-# ── Load and merge ─────────────────────────────────────────────────────────────
-val_df   = pd.read_csv(project_file("validated_triplets.csv"))
-val_df   = val_df[val_df["Validated"] == True].reset_index(drop=True)
-
-try:
-    strat_df = pd.read_csv(project_file("triplet_strategy_results.csv"))
-    has_strat = True
-except FileNotFoundError:
-    has_strat = False
-    print("Note: triplet_strategy_results.csv not found — run triplet_strategy.py first")
-
-# Add economic interpretation
-val_df["Economic_Reason"] = val_df.apply(interpret, axis=1)
-
-# Merge strategy results if available
-if has_strat:
-    merge_cols = ["Stock_A","Stock_B","Stock_C","Horizon_k"]
-    final_df = val_df.merge(
-        strat_df[merge_cols + ["Sharpe_IS","Sharpe_OOS","MaxDD_OOS","WinRate_OOS","NTrades_OOS"]],
-        on=merge_cols, how="left"
-    )
-else:
-    final_df = val_df.copy()
-    for c in ["Sharpe_IS","Sharpe_OOS","MaxDD_OOS","WinRate_OOS","NTrades_OOS"]:
-        final_df[c] = np.nan
-
-# Sort by OOS R²
-final_df = final_df.sort_values("OOS_R2", ascending=False).reset_index(drop=True)
-
-# ── Save ──────────────────────────────────────────────────────────────────────
-final_df.to_csv(project_file("final_results_table.csv"), index=False)
-
-# ── Print clean report table ───────────────────────────────────────────────────
-print("=" * 100)
-print("FINAL VALIDATED TRIPLETS — REPORT TABLE")
-print("=" * 100)
-
-report_cols = [
-    "Stock_A","Stock_B","Stock_C","Horizon_k",
-    "Beta1_A","Beta2_B","IS_R2","OOS_R2",
-    "Shuffle_pval","Rolling_Sig_Pct",
-]
-if has_strat:
-    report_cols += ["Sharpe_IS","Sharpe_OOS","MaxDD_OOS","WinRate_OOS"]
-report_cols += ["Economic_Reason"]
-
-for _, row in final_df[report_cols].iterrows():
-    print()
-    print(f"  Triplet : {row['Stock_A']} + {row['Stock_B']} → {row['Stock_C']}  (k={row['Horizon_k']}d)")
-    print(f"  Betas   : β₁={row['Beta1_A']:+.4f}  β₂={row['Beta2_B']:+.4f}")
-    print(f"  R²      : IS={row['IS_R2']:.4f}  OOS={row['OOS_R2']:.4f}")
-    print(f"  Valid.  : Shuffle_p={row['Shuffle_pval']:.3f}  Rolling%={row['Rolling_Sig_Pct']:.2f}")
-    if has_strat:
-        print(f"  Strategy: Sharpe(IS)={row['Sharpe_IS']:.3f}  Sharpe(OOS)={row['Sharpe_OOS']:.3f}"
-              f"  MaxDD={row['MaxDD_OOS']:.4f}  WinRate={row['WinRate_OOS']:.2%}")
-    print(f"  Econ.   : {row['Economic_Reason']}")
-
-print()
-print(f"\nSaved → final_results_table.csv")
-print(f"Total validated triplets: {len(final_df)}")
-
-# Summary statistics
-print("\n=== KEY FINDINGS SUMMARY ===")
-print(f"Triplets screened       : 177 (all pairs from 25-stock NSE universe)")
-print(f"Statistically significant: 177 (p<0.05, R²>1%) [from triplet_full_significant.csv]")
-print(f"Shuffle-genuine          : {(val_df['Genuine']).sum()} / {len(val_df)} validated triplets")
-print(f"OOS-positive             : {(val_df['OOS_Pos']).sum()} / {len(val_df)} validated triplets")
-print(f"Validated (≥2/3 tests)  : {len(final_df)}")
-
-top = final_df.iloc[0]
-print(f"\nBest triplet (by OOS R²): {top['Stock_A']} + {top['Stock_B']} → {top['Stock_C']}")
-print(f"  k={top['Horizon_k']}d, IS R²={top['IS_R2']:.4f}, OOS R²={top['OOS_R2']:.4f}")
-print(f"  {top['Economic_Reason']}")
+if __name__=='__main__': main()

@@ -1,168 +1,99 @@
-"""
-Step 3 (Full Universe): Triplet Screener — All Pairs
-Given every possible anchor pair (A, B) from the full 25-stock universe,
-find a third stock C such that r_C(t+k) is predictable from r_A(t) and r_B(t).
-
-Since all optimal lags were 0, we use lag_L=0 for all pairs (same-day co-movement).
-The conditional expectation is: E[r_C(t+k) | r_A(t), r_B(t)]
-
-Fits: r_C(t+k) = alpha + beta1*r_A(t) + beta2*r_B(t) + epsilon
-Records beta1, beta2, p-values, R² for all (pair, C, horizon k) combos.
-
-Outputs:
-  - triplet_full_significant.csv  : passes both p-value and R² filter
-  - triplet_full_all.csv          : every result (large file)
-"""
-
-from project_paths import project_file
-
-import pandas as pd
+"""Stage 1: training-only screen and frozen candidate list."""
+from pathlib import Path
+import argparse, hashlib, itertools, json, platform, zipfile
 import numpy as np
+import pandas as pd
+import scipy
+import statsmodels
 import statsmodels.api as sm
-import itertools
+from statsmodels.stats.multitest import multipletests
 
-# --- Config ---
-K_HORIZONS    = [1, 2, 3, 5]   # prediction horizons in trading days
-P_THRESHOLD   = 0.05            # significance level for both betas
-R2_THRESHOLD  = 0.01            # minimum R² to consider (1%)
-MIN_OBS       = 200             # minimum observations per regression
-LAG_L         = 0               # all lags were 0 — using same-day anchor
+ROOT = Path(__file__).resolve().parents[1]
+SPLIT = pd.Timestamp('2023-01-01')
+HORIZONS = (1, 2, 3, 5)
+KEYS = ['Stock_A', 'Stock_B', 'Stock_C', 'Horizon_k']
 
-# --- Load returns ---
-returns_df = pd.read_csv(project_file("nse_log_returns.csv"), index_col=0, parse_dates=True)
-ALL_STOCKS = list(returns_df.columns)
-returns    = {s: returns_df[s].to_numpy() for s in ALL_STOCKS}
-n          = len(returns_df)
+def aligned(frame, a, b, c, k):
+    """Split on both feature and target dates; never let training labels cross split."""
+    x = frame[[a, b]].iloc[:-k].to_numpy()
+    y = frame[c].iloc[k:].to_numpy()
+    features, targets = frame.index[:-k], frame.index[k:]
+    train = (features < SPLIT) & (targets < SPLIT)
+    test = (features >= SPLIT) & (targets >= SPLIT)
+    return x, y, features, targets, np.asarray(train), np.asarray(test)
 
-print(f"Universe : {len(ALL_STOCKS)} stocks")
-print(f"Obs      : {n} trading days")
 
-# Generate all (A, B) pairs — A != B, unordered
-ALL_PAIRS = list(itertools.combinations(ALL_STOCKS, 2))
-print(f"Anchor pairs: {len(ALL_PAIRS)}")
-total = len(ALL_PAIRS) * len(ALL_STOCKS) * len(K_HORIZONS)
-print(f"Total regressions to run: ~{total:,} (skipping C in {{A,B}})\n")
+def fit(x, y):
+    return sm.OLS(y, sm.add_constant(x, has_constant='add')).fit()
 
-# --- Regression helper ---
-def run_regression(r_a, r_b, r_c, k, min_obs=MIN_OBS):
-    """
-    Regress r_C(t+k) on [1, r_A(t), r_B(t)].
-    Returns dict of results or None if insufficient data.
-    """
-    max_k = max(k, 0)
-    t_end = n - max_k - 1  # last valid t (inclusive)
-    if t_end < min_obs:
-        return None
 
-    t_idx = np.arange(0, t_end + 1)
-    x1    = r_a[t_idx]          # r_A(t)
-    x2    = r_b[t_idx]          # r_B(t)  [lag=0]
-    y     = r_c[t_idx + k]      # r_C(t+k)
+def r2(y, pred, baseline):
+    den = float(np.sum((y-baseline)**2))
+    return float(1-np.sum((y-pred)**2)/den) if den > 0 else np.nan
 
-    mask = np.isfinite(x1) & np.isfinite(x2) & np.isfinite(y)
-    if mask.sum() < min_obs:
-        return None
 
-    X = sm.add_constant(np.column_stack([x1[mask], x2[mask]]))
-    try:
-        res = sm.OLS(y[mask], X).fit()
-    except Exception:
-        return None
+def parse_args(description, shuffles=False):
+    parser=argparse.ArgumentParser(description=description)
+    parser.add_argument('--output',type=Path,default=ROOT/'results/training_only')
+    if shuffles: parser.add_argument('--shuffles',type=int,default=1000)
+    args=parser.parse_args()
+    if shuffles and args.shuffles<1: parser.error('--shuffles must be positive')
+    return args
 
-    return {
-        "alpha":   res.params[0],
-        "beta1":   res.params[1],
-        "beta2":   res.params[2],
-        "p_beta1": res.pvalues[1],
-        "p_beta2": res.pvalues[2],
-        "r2":      res.rsquared,
-        "n_obs":   int(res.nobs),
-    }
+def digest(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
-# --- Main loop ---
-records = []
-done    = 0
+def load_frame():
+    source = ROOT/'data/nse_log_returns.csv'
+    frame = pd.read_csv(source,index_col=0,parse_dates=True)
+    if not frame.index.is_monotonic_increasing or not frame.index.is_unique:
+        raise ValueError('Dates must be sorted and unique')
+    if frame.shape[1] != 25 or not np.isfinite(frame.to_numpy()).all():
+        raise ValueError('Expected 25 stocks with finite returns')
+    if (frame.index < SPLIT).sum() < 300 or (frame.index >= SPLIT).sum() < 100:
+        raise ValueError('Insufficient data around the fixed split')
+    return source,frame
 
-for (stock_a, stock_b) in ALL_PAIRS:
-    r_a = returns[stock_a]
-    r_b = returns[stock_b]
+def verify_source(meta, source):
+    if digest(source)!=meta['source_sha256'] or meta['split']!=str(SPLIT.date()) or meta['horizons']!=list(HORIZONS):
+        raise ValueError('Data or split/horizons changed. Rerun screening in a new output directory.')
 
-    candidate_C = [s for s in ALL_STOCKS if s not in (stock_a, stock_b)]
+def main():
+    args=parse_args(__doc__)
+    out=args.output.resolve()
+    if out.exists(): raise SystemExit(f'Output exists: {out}. Use --output with a new directory to preserve previous results.')
+    source,frame=load_frame()
+    out.mkdir(parents=True)
+    rows=[]
+    pairs=list(itertools.combinations(frame.columns,2))
+    for number,(a,b) in enumerate(pairs,1):
+        for c in frame.columns:
+            if c in (a,b): continue
+            for k in HORIZONS:
+                x,y,fd,td,tr,te=aligned(frame,a,b,c,k)
+                m=fit(x[tr],y[tr])
+                rows.append(dict(Stock_A=a,Stock_B=b,Stock_C=c,Horizon_k=k,
+                    N_Train=int(tr.sum()),Alpha=m.params[0],Beta1_A=m.params[1],
+                    Beta2_B=m.params[2],Train_p_A=m.pvalues[1],Train_p_B=m.pvalues[2],
+                    Train_R2=m.rsquared,Train_Last_Feature=str(fd[tr][-1].date()),
+                    Train_Last_Target=str(td[tr][-1].date())))
+        if number%25==0: print(f'Screening {number}/{len(pairs)} pairs',flush=True)
+    screen=pd.DataFrame(rows)
+    # max(p_A,p_B) tests the conjunction that both slopes differ from zero.
+    # BY is conservative under arbitrary dependence; p-values retain OLS assumptions.
+    screen['Train_Both_P']=screen[['Train_p_A','Train_p_B']].max(axis=1)
+    screen['Train_BY_Q']=multipletests(screen.Train_Both_P,method='fdr_by')[1]
+    screen['Selected_Train_Only']=(screen.Train_p_A<.05)&(screen.Train_p_B<.05)&(screen.Train_R2>.01)
+    screen.to_csv(out/'training_screen_all.csv',index=False)
+    candidates=screen[screen.Selected_Train_Only].copy()
+    # Freeze selection before any evaluation on later-period returns.
+    candidates.to_csv(out/'frozen_training_candidates.csv',index=False)
+    frozen_hash=hashlib.sha256((out/'frozen_training_candidates.csv').read_bytes()).hexdigest()
 
-    for stock_c in candidate_C:
-        r_c = returns[stock_c]
+    meta=dict(source_sha256=digest(source),candidate_sha256=frozen_hash,screen_sha256=digest(out/'training_screen_all.csv'),
+        split=str(SPLIT.date()),horizons=list(HORIZONS),screened=len(screen),training_selected=len(candidates),
+        screening_script_sha256=digest(__file__))
+    (out/'screen_manifest.json').write_text(json.dumps(meta,indent=2)+'\n')
+    print(f'Screened {len(screen)} models; froze {len(candidates)} training-only candidates. Next run triplet_validation.py.',flush=True)
 
-        for k in K_HORIZONS:
-            done += 1
-            res = run_regression(r_a, r_b, r_c, k)
-            if res is None:
-                continue
-
-            records.append({
-                "Stock_A":   stock_a,
-                "Stock_B":   stock_b,
-                "Stock_C":   stock_c,
-                "Horizon_k": k,
-                "Beta1_A":   round(res["beta1"],  6),
-                "Beta2_B":   round(res["beta2"],  6),
-                "p_Beta1":   round(res["p_beta1"], 4),
-                "p_Beta2":   round(res["p_beta2"], 4),
-                "R2":        round(res["r2"],      4),
-                "Alpha":     round(res["alpha"],   6),
-                "N_obs":     res["n_obs"],
-            })
-
-    # Progress
-    pairs_done = ALL_PAIRS.index((stock_a, stock_b)) + 1
-    if pairs_done % 50 == 0 or pairs_done == len(ALL_PAIRS):
-        print(f"  {pairs_done}/{len(ALL_PAIRS)} pairs done — {len(records):,} results so far")
-
-# --- Save full results ---
-all_df = pd.DataFrame(records)
-all_df.to_csv(project_file("triplet_full_all.csv"), index=False)
-print(f"\nFull results: {len(all_df):,} rows → triplet_full_all.csv")
-
-# --- Filter significant ---
-sig_df = all_df[
-    (all_df["p_Beta1"] < P_THRESHOLD) &
-    (all_df["p_Beta2"] < P_THRESHOLD) &
-    (all_df["R2"]      > R2_THRESHOLD)
-].copy().sort_values("R2", ascending=False).reset_index(drop=True)
-
-sig_df.to_csv(project_file("triplet_full_significant.csv"), index=False)
-print(f"Significant triplets (p<{P_THRESHOLD}, R²>{R2_THRESHOLD}): {len(sig_df)}")
-
-# --- Summary ---
-if len(sig_df) > 0:
-    print("\n=== TOP 30 SIGNIFICANT TRIPLETS BY R² ===")
-    cols = ["Stock_A", "Stock_B", "Stock_C", "Horizon_k",
-            "Beta1_A", "Beta2_B", "p_Beta1", "p_Beta2", "R2"]
-    print(sig_df[cols].head(30).to_string(index=False))
-
-    # Count by horizon
-    print("\n=== SIGNIFICANT COUNT BY HORIZON ===")
-    print(sig_df.groupby("Horizon_k").size().rename("Count"))
-
-    # Count by Stock_C — which stock is most predictable?
-    print("\n=== MOST FREQUENTLY PREDICTED STOCK_C ===")
-    print(sig_df["Stock_C"].value_counts().head(10))
-
-    # Count by anchor pair — which pairs are most useful?
-    print("\n=== MOST USEFUL ANCHOR PAIRS ===")
-    sig_df["Anchor"] = sig_df["Stock_A"] + " + " + sig_df["Stock_B"]
-    print(sig_df["Anchor"].value_counts().head(10))
-
-else:
-    print("\nNo triplets passed both filters.")
-    print("Showing top 20 by R² regardless of significance:\n")
-    cols = ["Stock_A", "Stock_B", "Stock_C", "Horizon_k",
-            "Beta1_A", "Beta2_B", "p_Beta1", "p_Beta2", "R2"]
-    print(all_df.sort_values("R2", ascending=False).head(20)[cols].to_string(index=False))
-
-    # Also show relaxed filter
-    relaxed = all_df[
-        (all_df["p_Beta1"] < 0.10) &
-        (all_df["p_Beta2"] < 0.10) &
-        (all_df["R2"]      > 0.005)
-    ]
-    print(f"\nWith relaxed thresholds (p<0.10, R²>0.005): {len(relaxed)} triplets")
+if __name__=='__main__': main()
